@@ -1,0 +1,13 @@
+[project]
+name = "poggio-mcp-client"
+version = "0.1.0" 
+description = "Minimal Poggio MCP client example"
+dependencies = [
+    "pydantic>=2.0.0",
+    "mcp>=1.0.0",
+    "httpx>=0.24.0",
+]
+requires-python = ">=3.10"
+
+[tool.uv]
+dev-dependencies = []
