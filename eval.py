@@ -285,70 +285,111 @@ async def main():
     parser = argparse.ArgumentParser(description="Evaluate domain content using LLM-as-a-judge")
     parser.add_argument("domain", help="Target domain to evaluate")
     parser.add_argument("--model", default="gpt-5-mini", help="OpenAI model to use (default: gpt-5-mini)")
+    parser.add_argument("--out-dir", default=".", help="Output directory for results (default: current directory)")
+    parser.add_argument("--mode", choices=["fetch", "eval", "fetch-and-eval"], default="fetch-and-eval", 
+                       help="Mode: 'fetch' (only fetch content), 'eval' (only evaluate existing content), 'fetch-and-eval' (fetch and evaluate)")
     args = parser.parse_args()
 
-    # Load evaluation configuration
-    try:
-        with open("config.json", "r") as f:
-            config_data = json.load(f)
-        config = EvalConfig.model_validate(config_data)
-        logger.info(f"Loaded evaluation config with {len(config.dimensions)} dimensions")
-    except Exception as e:
-        logger.error(f"Error loading config.json: {e}")
-        return
+    # Prepare file paths
+    norm_domain = args.domain.replace('.', '_')
+    raw_input_file = os.path.join(args.out_dir, f"eval_raw_input_{norm_domain}.txt")
+    
+    content = ""
+    
+    # Handle fetch mode
+    if args.mode in ["fetch", "fetch-and-eval"]:
+        # Setup MCP client
+        server_url = os.getenv("POGGIO_MCP_SERVER_URL", "https://mcp.poggio.io/mcp")
+        auth_token = os.getenv("POGGIO_AUTH_TOKEN")
 
-    # Setup OpenAI client
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        logger.error("OPENAI_API_KEY environment variable is required")
-        return
+        if not auth_token:
+            logger.error("POGGIO_AUTH_TOKEN environment variable is required")
+            return
 
-    openai_client = openai.AsyncOpenAI(api_key=openai_api_key)
+        logger.info(f"Starting content fetch for domain: {args.domain}")
+        logger.info(f"Server URL: {server_url}")
 
-    # Setup MCP client
-    server_url = os.getenv("POGGIO_MCP_SERVER_URL", "https://mcp.poggio.io/mcp")
-    auth_token = os.getenv("POGGIO_AUTH_TOKEN")
+        async with streamablehttp_client(
+            url=server_url,
+            headers={"Authorization": f"Bearer {auth_token}"}
+        ) as (read_stream, write_stream, get_session_id):
 
-    if not auth_token:
-        logger.error("POGGIO_AUTH_TOKEN environment variable is required")
-        return
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                logger.info("Connected to MCP server")
 
-    logger.info(f"Starting evaluation for domain: {args.domain}")
-    logger.info(f"Using OpenAI model: {args.model}")
-    logger.info(f"Server URL: {server_url}")
+                # Create account
+                logger.info(f"Creating account for domain: {args.domain}")
+                account = await create_account(session, args.domain)
+                logger.info(f"Account ready - ID: {account.id}, Org: {account.org_id}")
 
-    async with streamablehttp_client(
-        url=server_url,
-        headers={"Authorization": f"Bearer {auth_token}"}
-    ) as (read_stream, write_stream, get_session_id):
+                # Fetch all domain content
+                content = await fetch_all_domain_content(session, args.domain)
+                
+                if not content.strip():
+                    logger.error("No content found for domain. Cannot perform evaluation.")
+                    return
 
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            logger.info("Connected to MCP server")
+        # Save raw input content to text file
+        os.makedirs(args.out_dir, exist_ok=True)
+        with open(raw_input_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"Raw input content saved to: {raw_input_file}")
+        
+        if args.mode == "fetch":
+            logger.info("Fetch mode complete. Use --mode eval to evaluate the content.")
+            return
 
-            # Create account
-            logger.info(f"Creating account for domain: {args.domain}")
-            account = await create_account(session, args.domain)
-            logger.info(f"Account ready - ID: {account.id}, Org: {account.org_id}")
+    # Handle eval mode
+    if args.mode in ["eval", "fetch-and-eval"]:
+        # Load evaluation configuration
+        try:
+            with open("config.json", "r") as f:
+                config_data = json.load(f)
+            config = EvalConfig.model_validate(config_data)
+            logger.info(f"Loaded evaluation config with {len(config.dimensions)} dimensions")
+        except Exception as e:
+            logger.error(f"Error loading config.json: {e}")
+            return
 
-            # Fetch all domain content
-            content = await fetch_all_domain_content(session, args.domain)
+        # Setup OpenAI client
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            logger.error("OPENAI_API_KEY environment variable is required")
+            return
 
+        openai_client = openai.AsyncOpenAI(api_key=openai_api_key)
+        
+        # Load content if not already fetched
+        if args.mode == "eval":
+            if not os.path.exists(raw_input_file):
+                logger.error(f"Raw input file not found: {raw_input_file}")
+                logger.error("Run with --mode fetch first, or use --mode fetch-and-eval")
+                return
+                
+            logger.info(f"Loading content from: {raw_input_file}")
+            with open(raw_input_file, "r", encoding="utf-8") as f:
+                content = f.read()
+                
             if not content.strip():
-                logger.error("No content found for domain. Cannot perform evaluation.")
+                logger.error("Raw input file is empty. Cannot perform evaluation.")
                 return
 
-            # Evaluate each dimension
-            evaluation_results = []
+        logger.info(f"Starting evaluation for domain: {args.domain}")
+        logger.info(f"Using OpenAI model: {args.model}")
+        logger.info(f"Content length: {len(content):,} characters")
 
-            for dimension in config.dimensions:
-                result = await evaluate_dimension(
-                    openai_client,
-                    content,
-                    dimension,
-                    args.model
-                )
-                evaluation_results.append(result)
+        # Evaluate each dimension
+        evaluation_results = []
+        
+        for dimension in config.dimensions:
+            result = await evaluate_dimension(
+                openai_client, 
+                content, 
+                dimension, 
+                args.model
+            )
+            evaluation_results.append(result)
 
             # Calculate summary statistics
             total_score = sum(r.score for r in evaluation_results)
@@ -382,10 +423,18 @@ async def main():
                 print("-" * 40)
 
             # Save detailed results to JSON file
-            output_file = f"eval_results_{args.domain.replace('.', '_')}.json"
+            os.makedirs(args.out_dir, exist_ok=True)
+            norm_domain = args.domain.replace('.', '_')
+            output_file = os.path.join(args.out_dir, f"eval_results_{norm_domain}.json")
             with open(output_file, "w") as f:
                 json.dump(summary.model_dump(), f, indent=2)
             print(f"\nDetailed results saved to: {output_file}")
+            
+            # Save raw input content to text file
+            raw_input_file = os.path.join(args.out_dir, f"eval_raw_input_{norm_domain}.txt")
+            with open(raw_input_file, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"Raw input content saved to: {raw_input_file}")
 
 
 if __name__ == "__main__":

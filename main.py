@@ -1,6 +1,7 @@
 """Simple Poggio MCP client example."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -14,8 +15,9 @@ from typing import Any, Dict, List, Optional
 # Configuration
 DOMAIN = "example.com"
 TARGET_PAGES = {"Overview", "Business Case"}
-POLL_INTERVAL = 5  # seconds
+POLL_INTERVAL = 30  # seconds
 MAX_POLL_TIME = 600  # 10 minutes
+MAX_PAGE_AGE_DAYS = 60  # Maximum age of pages before triggering recreation
 
 # Setup logging
 logging.basicConfig(
@@ -133,6 +135,50 @@ async def fetch_item(session: ClientSession, item_id: str) -> Optional[ItemWithM
         return None
 
 
+async def recreate_account_pages(session: ClientSession, domain: str) -> bool:
+    """Recreate all pages for an account."""
+    try:
+        logger.info(f"Recreating pages for domain: {domain}")
+        result = await session.call_tool("recreate_account_pages", {"account_domain": domain})
+        logger.info(f"Pages recreation initiated for {domain}")
+        return True
+    except Exception as e:
+        logger.error(f"Error recreating pages: {e}")
+        return False
+
+
+def is_page_too_old(created_at: str, max_age_days: int) -> bool:
+    """Check if a page is older than max_age_days."""
+    try:
+        page_created = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        age = datetime.now(timezone.utc) - page_created
+        return age > timedelta(days=max_age_days)
+    except Exception as e:
+        logger.warning(f"Error parsing created_at timestamp '{created_at}': {e}")
+        return False
+
+
+async def check_age_and_recreate_if_needed(session: ClientSession, domain: str) -> bool:
+    """Check if any pages are too old and recreate if needed. Returns True if recreation was triggered."""
+    items = await search_items(session, domain)
+    
+    old_pages = []
+    for item in items:
+        if item.id != "workspace_info" and item.metadata and "created_at" in item.metadata:
+            created_at = item.metadata["created_at"]
+            if is_page_too_old(created_at, MAX_PAGE_AGE_DAYS):
+                old_pages.append((item.title, created_at))
+    
+    if old_pages:
+        logger.info(f"Found {len(old_pages)} pages older than {MAX_PAGE_AGE_DAYS} days:")
+        for title, created_at in old_pages:
+            logger.info(f"  - '{title}' (created: {created_at})")
+        return await recreate_account_pages(session, domain)
+    
+    logger.info(f"All pages are within {MAX_PAGE_AGE_DAYS} days, no recreation needed")
+    return False
+
+
 async def wait_for_pages(session: ClientSession, domain: str, target_pages: Set[str]) -> List[ItemWithMetadata]:
     """Poll search results until target pages are available."""
     logger.info(f"Polling for pages: {', '.join(target_pages)}")
@@ -213,11 +259,15 @@ async def main():
             account = await create_account(session, DOMAIN)
             logger.info(f"Account ready - ID: {account.id}, Org: {account.org_id}")
 
-            # Step 2: Poll for target pages
+            # Step 2: Check page age and recreate if needed
+            logger.info("Checking page ages...")
+            await check_age_and_recreate_if_needed(session, DOMAIN)
+
+            # Step 3: Poll for target pages
             logger.info("Starting to poll for target pages...")
             ready_pages = await wait_for_pages(session, DOMAIN, TARGET_PAGES)
 
-            # Step 3: Fetch and log the pages
+            # Step 4: Fetch and log the pages
             if ready_pages:
                 logger.info(f"Fetching {len(ready_pages)} ready pages...")
 
